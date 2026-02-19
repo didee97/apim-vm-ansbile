@@ -1,0 +1,17 @@
+[Unit]
+Description=WSO2 API Manager
+After=network.target
+
+[Service]
+Type=forking
+User={{ ansible_user }}
+Environment="JAVA_HOME={{ java_home }}/"
+WorkingDirectory={{ apim_home }}
+ExecStart={{ apim_home }}/bin/api-manager.sh start
+ExecStop={{ apim_home }}/bin/api-manager.sh stop
+Restart=always
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+

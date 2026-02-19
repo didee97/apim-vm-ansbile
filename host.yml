@@ -1,0 +1,16 @@
+- name: Debug
+  hosts: apim
+  become: true
+
+  vars_files:
+    - vars.yml
+
+  tasks:
+    - name: Show current host and APIM nodes list
+      debug:
+        msg:
+          - "Current host: {{ inventory_hostname }}"
+          - "APIM nodes: {{ groups['apim'] }}"
+          - "Node index 0: {{ groups['apim'][0] }}"
+          - "Node index 1: {{ groups['apim'][1] }}"
+
