@@ -1,0 +1,100 @@
+---
+- name: Install PostgreSQL
+  ansible.builtin.apt:
+    name:
+      - postgresql
+      - python3-psycopg2
+    state: present
+
+- name: Start PostgreSQL
+  ansible.builtin.systemd:
+    name: postgresql
+    state: started
+    enabled: true
+
+- name: Listen on all interfaces
+  community.postgresql.postgresql_alter_system:
+    param: listen_addresses
+    value: "*"
+  become: true
+  become_user: postgres
+  notify: Restart postgresql
+
+- name: Find pg_hba.conf
+  community.postgresql.postgresql_query:
+    query: SHOW hba_file
+  become: true
+  become_user: postgres
+  register: db_hba_file
+  changed_when: false
+
+- name: Allow APIM nodes to connect
+  community.postgresql.postgresql_pg_hba:
+    dest: "{{ db_hba_file.query_result[0].hba_file }}"
+    contype: host
+    users: "{{ db_user }}"
+    databases: "{{ apim_db_name }},{{ shared_db_name }}"
+    source: "{{ hostvars[item].private_ip }}/32"
+    method: scram-sha-256
+  loop: "{{ groups['apim'] }}"
+  become: true
+  become_user: postgres
+  notify: Reload postgresql
+
+- name: Flush handlers (apply listen/hba changes now)
+  ansible.builtin.meta: flush_handlers
+
+- name: Create DB user
+  community.postgresql.postgresql_user:
+    name: "{{ db_user }}"
+    password: "{{ db_password }}"
+  become: true
+  become_user: postgres
+  no_log: true
+
+# Owner = WSO2 user, so it can create tables in "public" (PostgreSQL 15+)
+- name: Create databases
+  community.postgresql.postgresql_db:
+    name: "{{ item }}"
+    owner: "{{ db_user }}"
+    encoding: UTF-8
+    template: template0
+  loop: ["{{ apim_db_name }}", "{{ shared_db_name }}"]
+  become: true
+  become_user: postgres
+
+- name: Count existing tables
+  community.postgresql.postgresql_query:
+    login_db: "{{ item.db }}"
+    query: SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = 'public'
+  loop:
+    - { db: "{{ apim_db_name }}", sql: apim.sql }
+    - { db: "{{ shared_db_name }}", sql: shared.sql }
+  become: true
+  become_user: postgres
+  register: db_table_count
+  changed_when: false
+
+# Run as the WSO2 user so it owns every table/sequence it creates
+- name: Import SQL scripts into empty databases
+  ansible.builtin.command:
+    argv:
+      - psql
+      - -h
+      - 127.0.0.1
+      - -U
+      - "{{ db_user }}"
+      - -d
+      - "{{ item.item.db }}"
+      - -v
+      - ON_ERROR_STOP=1
+      - -q
+      - -f
+      - "{{ sql_dir }}/{{ item.item.sql }}"
+  environment:
+    PGPASSWORD: "{{ db_password }}"
+  loop: "{{ db_table_count.results }}"
+  loop_control:
+    label: "{{ item.item.db }}"
+  when: item.query_result[0].n | int == 0
+  changed_when: true

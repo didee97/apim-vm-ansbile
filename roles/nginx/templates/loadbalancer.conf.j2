@@ -1,0 +1,23 @@
+# {{ ansible_managed }}
+server_names_hash_bucket_size 128;
+
+# Control plane (Publisher / DevPortal / Admin / Carbon) - sticky sessions
+upstream apim_cp {
+    ip_hash;
+{% for node in groups['apim'] %}
+    server {{ hostvars[node].private_ip }}:9443;
+{% endfor %}
+}
+
+# Gateway (API traffic)
+upstream apim_gw {
+{% for node in groups['apim'] %}
+    server {{ hostvars[node].private_ip }}:8243;
+{% endfor %}
+}
+
+# WebSocket upgrade support
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}

@@ -1,0 +1,60 @@
+---
+- name: Install nginx
+  ansible.builtin.apt:
+    name: nginx
+    state: present
+
+- name: Create SSL directory
+  ansible.builtin.file:
+    path: "{{ ssl_dir }}"
+    state: directory
+    mode: "0750"
+
+- name: Copy SSL certificate and key ({{ ssl_mode }})
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ ssl_dir }}/{{ item.dest }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { src: "{{ ssl_cert_src }}", dest: apim.crt, mode: "0644" }
+    - { src: "{{ ssl_key_src }}", dest: apim.key, mode: "0600" }
+  loop_control:
+    label: "{{ item.dest }}"
+  notify: Reload nginx
+
+- name: Deploy load balancer upstreams
+  ansible.builtin.template:
+    src: loadbalancer.conf.j2
+    dest: /etc/nginx/conf.d/loadbalancer.conf
+    mode: "0644"
+  notify: Reload nginx
+
+- name: Deploy APIM server blocks
+  ansible.builtin.template:
+    src: apim.conf.j2
+    dest: /etc/nginx/sites-available/apim.conf
+    mode: "0644"
+  notify: Reload nginx
+
+- name: Enable APIM site
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/apim.conf
+    dest: /etc/nginx/sites-enabled/apim.conf
+    state: link
+  notify: Reload nginx
+
+- name: Remove default nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Reload nginx
+
+- name: Validate nginx configuration
+  ansible.builtin.command: nginx -t
+  changed_when: false
+
+- name: Start nginx
+  ansible.builtin.systemd:
+    name: nginx
+    state: started
+    enabled: true

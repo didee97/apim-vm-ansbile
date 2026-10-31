@@ -1,0 +1,13 @@
+# {{ ansible_managed }}
+# WSO2's parsers.conf, kept apart from Fluent Bit's default parsers.conf
+
+[PARSER]
+    Name            apim_metrics_parser
+    Format          regex
+    Regex           ^\s*(?:.*?)\s+apimMetrics:\s*(?<apimMetrics>[^,]+?),\s*(?:.*?)\s*:\s*(?<properties>\{.*\})\s*(?:.*)$
+
+[PARSER]
+    Name        jsonparser
+    Format      json
+    Time_Key    time
+    Time_Keep   On

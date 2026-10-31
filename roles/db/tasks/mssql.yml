@@ -1,0 +1,163 @@
+---
+- name: Check host supports SQL Server
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - ansible_facts.distribution == 'Ubuntu'
+      - ansible_facts.distribution_version in ['20.04', '22.04']
+      - ansible_facts.memtotal_mb >= 1900
+    fail_msg: >-
+      SQL Server {{ mssql_release }} needs Ubuntu 20.04/22.04 and 2 GB+ RAM
+      (found {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}, {{ ansible_facts.memtotal_mb }} MB).
+
+- name: Create apt keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Add Microsoft signing key
+  ansible.builtin.get_url:
+    url: https://packages.microsoft.com/keys/microsoft.asc
+    dest: /etc/apt/keyrings/microsoft.asc
+    mode: "0644"
+
+- name: Add Microsoft repositories
+  ansible.builtin.deb822_repository:
+    name: "microsoft-{{ item }}"
+    types: deb
+    uris: "https://packages.microsoft.com/ubuntu/{{ ansible_facts.distribution_version }}/{{ item }}"
+    suites: "{{ ansible_facts.distribution_release }}"
+    components: main
+    architectures: amd64
+    signed_by: /etc/apt/keyrings/microsoft.asc
+  loop:
+    - "mssql-server-{{ mssql_release }}"
+    - prod                      # mssql-tools18 (sqlcmd)
+
+# Left behind by older versions of this playbook (apt_repository)
+- name: Remove old-style Microsoft repository files
+  ansible.builtin.file:
+    path: "/etc/apt/sources.list.d/microsoft-{{ item }}.list"
+    state: absent
+  loop:
+    - "mssql-server-{{ mssql_release }}"
+    - prod
+
+- name: Install SQL Server and sqlcmd
+  ansible.builtin.apt:
+    name:
+      - mssql-server
+      - mssql-tools18
+      - unixodbc-dev
+    state: present
+    update_cache: true
+  environment:
+    ACCEPT_EULA: "Y"
+
+- name: Run SQL Server first-time setup
+  ansible.builtin.command: /opt/mssql/bin/mssql-conf -n setup accept-eula
+  environment:
+    MSSQL_SA_PASSWORD: "{{ mssql_sa_password }}"
+    MSSQL_PID: "{{ mssql_pid }}"
+  args:
+    creates: /var/opt/mssql/data/master.mdf
+  no_log: true
+
+- name: Start SQL Server
+  ansible.builtin.systemd:
+    name: mssql-server
+    state: started
+    enabled: true
+
+- name: Wait for SQL Server
+  ansible.builtin.wait_for:
+    port: 1433
+    timeout: 120
+
+# -C trusts the self-signed server cert; -b exits non-zero on SQL errors.
+# The SA password goes through SQLCMDPASSWORD so it never shows up in `ps`.
+- name: Create databases, login and users
+  ansible.builtin.command:
+    argv:
+      - /opt/mssql-tools18/bin/sqlcmd
+      - -S
+      - localhost
+      - -U
+      - sa
+      - -C
+      - -b
+      - -Q
+      - "{{ sql }}"
+  environment:
+    SQLCMDPASSWORD: "{{ mssql_sa_password }}"
+  vars:
+    sql: |
+      SET NOCOUNT ON;
+      DECLARE @changed INT = 0;
+      IF DB_ID('{{ apim_db_name }}') IS NULL BEGIN CREATE DATABASE [{{ apim_db_name }}]; SET @changed = 1; END;
+      IF DB_ID('{{ shared_db_name }}') IS NULL BEGIN CREATE DATABASE [{{ shared_db_name }}]; SET @changed = 1; END;
+      IF SUSER_ID('{{ db_user }}') IS NULL BEGIN
+        CREATE LOGIN [{{ db_user }}] WITH PASSWORD = N'{{ db_password | replace("'", "''") }}', CHECK_POLICY = OFF;
+        SET @changed = 1;
+      END
+      ELSE ALTER LOGIN [{{ db_user }}] WITH PASSWORD = N'{{ db_password | replace("'", "''") }}';
+      {% for d in [apim_db_name, shared_db_name] %}
+      EXEC('USE [{{ d }}];
+        IF USER_ID(''{{ db_user }}'') IS NULL BEGIN
+          CREATE USER [{{ db_user }}] FOR LOGIN [{{ db_user }}];
+          ALTER ROLE db_owner ADD MEMBER [{{ db_user }}];
+        END');
+      {% endfor %}
+      IF @changed = 1 PRINT 'CHANGED';
+  register: db_mssql_setup
+  changed_when: "'CHANGED' in db_mssql_setup.stdout"
+  no_log: true
+
+- name: Count existing tables
+  ansible.builtin.command:
+    argv:
+      - /opt/mssql-tools18/bin/sqlcmd
+      - -S
+      - localhost
+      - -U
+      - sa
+      - -C
+      - -b
+      - -h
+      - "-1"
+      - -W
+      - -d
+      - "{{ item.db }}"
+      - -Q
+      - "SET NOCOUNT ON; SELECT COUNT(*) FROM sys.tables"
+  environment:
+    SQLCMDPASSWORD: "{{ mssql_sa_password }}"
+  loop:
+    - { db: "{{ apim_db_name }}", sql: apim.sql }
+    - { db: "{{ shared_db_name }}", sql: shared.sql }
+  register: db_table_count
+  changed_when: false
+
+# Imported as the WSO2 login so it owns the objects
+- name: Import SQL scripts into empty databases
+  ansible.builtin.command:
+    argv:
+      - /opt/mssql-tools18/bin/sqlcmd
+      - -S
+      - localhost
+      - -U
+      - "{{ db_user }}"
+      - -C
+      - -b
+      - -d
+      - "{{ item.item.db }}"
+      - -i
+      - "{{ sql_dir }}/{{ item.item.sql }}"
+  environment:
+    SQLCMDPASSWORD: "{{ db_password }}"
+  loop: "{{ db_table_count.results }}"
+  loop_control:
+    label: "{{ item.item.db }}"
+  when: item.stdout | trim | int == 0
+  changed_when: true

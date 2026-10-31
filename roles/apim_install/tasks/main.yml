@@ -1,0 +1,61 @@
+---
+- name: Install Java
+  ansible.builtin.apt:
+    name: "{{ java_package }}"
+    state: present
+
+- name: Create APIM service user
+  ansible.builtin.user:
+    name: "{{ apim_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    home: "{{ apim_base_dir }}"
+    create_home: false
+
+- name: Create APIM base directory
+  ansible.builtin.file:
+    path: "{{ apim_base_dir }}"
+    state: directory
+    owner: "{{ apim_user }}"
+    group: "{{ apim_user }}"
+    mode: "0755"
+
+- name: Download WSO2 APIM {{ apim_version }}
+  ansible.builtin.get_url:
+    url: "{{ apim_zip_url }}"
+    dest: "{{ apim_base_dir }}/wso2am-{{ apim_version }}.zip"
+    mode: "0644"
+    timeout: 600
+  register: apim_install_zip
+  retries: 3
+  delay: 10
+  until: apim_install_zip is succeeded
+
+- name: Unzip WSO2 APIM
+  ansible.builtin.unarchive:
+    src: "{{ apim_base_dir }}/wso2am-{{ apim_version }}.zip"
+    dest: "{{ apim_base_dir }}"
+    remote_src: true
+    owner: "{{ apim_user }}"
+    group: "{{ apim_user }}"
+    creates: "{{ apim_home }}/bin/api-manager.sh"
+
+- name: Download JDBC driver for {{ db_type }}
+  ansible.builtin.get_url:
+    url: "{{ db.driver_url }}"
+    dest: "{{ apim_home }}/repository/components/lib/{{ db.driver_url | basename }}"
+    owner: "{{ apim_user }}"
+    group: "{{ apim_user }}"
+    mode: "0644"
+
+# The DB VM gets its SQL scripts from the APIM zip, so they always match
+# the APIM version being installed.
+- name: Fetch SQL scripts to the controller for {{ db_type }}
+  ansible.builtin.fetch:
+    src: "{{ apim_home }}/dbscripts/{{ item }}"
+    dest: "{{ dbscripts_cache }}/{{ item }}"
+    flat: true
+  loop:
+    - "{{ db.shared_sql }}"
+    - "{{ db.apim_sql }}"
+  run_once: true

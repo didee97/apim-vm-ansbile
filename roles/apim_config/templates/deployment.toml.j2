@@ -1,35 +1,45 @@
+{% macro jdbc_url(dbname) -%}
+{% if db_type == 'mysql' -%}
+jdbc:mysql://{{ db_host }}:{{ db.port }}/{{ dbname }}?autoReconnect=true&amp;allowPublicKeyRetrieval=true&amp;useSSL=false
+{%- elif db_type == 'postgres' -%}
+jdbc:postgresql://{{ db_host }}:{{ db.port }}/{{ dbname }}
+{%- else -%}
+jdbc:sqlserver://{{ db_host }}:{{ db.port }};databaseName={{ dbname }};SendStringParametersAsUnicode=false;encrypt=true;trustServerCertificate=true
+{%- endif %}
+{%- endmacro %}
+# {{ ansible_managed }}
+# WSO2 API Manager {{ apim_version }} - node {{ groups['apim'].index(inventory_hostname) + 1 }} of {{ groups['apim'] | length }} ({{ private_ip }})
+{% set other_nodes = groups['apim'] | reject('equalto', inventory_hostname) | map('extract', hostvars) | map(attribute='private_ip') | list %}
+{% set all_nodes = groups['apim'] | map('extract', hostvars) | map(attribute='private_ip') | list %}
+
 [transport.https.properties]
 proxyPort = 443
 
 [server]
-hostname = "am-uat.{{ domain_name }}"
+hostname = "{{ cp_domain }}"
 #offset=0
 base_path = "${carbon.protocol}://${carbon.host}:${carbon.management.port}"
 #discard_empty_caches = false
 server_role = "default"
 
 [super_admin]
-username = "admin"
-password = "admin"
+username = "{{ apim_admin_user }}"
+password = {{ apim_admin_password | to_json }}
 create_admin_account = true
 
 [user_store]
 type = "database_unique_id"
 
-[database.shared_db]
-type = "mysql"
-url = "jdbc:mysql://{{ groups['mysql'][0] }}:3306/WSO2AM_SHARED_DB?autoReconnect=true&amp;allowPublicKeyRetrieval=true&amp;useSSL=false"
-username = "{{ apim_db_user  }}"
-password = "{{ apim_db_password  }}"
-driver = "com.mysql.cj.jdbc.Driver"
+# Database: {{ db_type }} on {{ db_host }}
+{% for section, dbname in [('shared_db', shared_db_name), ('apim_db', apim_db_name)] %}
+[database.{{ section }}]
+type = "{{ db.toml_type }}"
+url = "{{ jdbc_url(dbname) }}"
+username = "{{ db_user }}"
+password = {{ db_password | to_json }}
+driver = "{{ db.driver_class }}"
 
-[database.apim_db]
-type = "mysql"
-url = "jdbc:mysql://{{ groups['mysql'][0] }}:3306/WSO2AM_DB?autoReconnect=true&amp;allowPublicKeyRetrieval=true&amp;useSSL=false"
-username = "{{ apim_db_user  }}"
-password = "{{ apim_db_password  }}"
-driver = "com.mysql.cj.jdbc.Driver"
-
+{% endfor %}
 [keystore.tls]
 file_name =  "wso2carbon.jks"
 type =  "JKS"
@@ -75,15 +85,19 @@ show_as_token_endpoint_url = true
 service_url = "https://localhost:${mgt.transport.https.port}/services/"
 username= "${admin.username}"
 password= "${admin.password}"
-ws_endpoint = "ws://api-uat.{{ domain_name }}:9099"
-wss_endpoint = "wss://api-uat.{{ domain_name }}:8099"
-http_endpoint = "http://api-uat.{{ domain_name }}:80"
-https_endpoint = "https://api-uat.{{ domain_name }}:443"
-websub_event_receiver_http_endpoint = "http://api-uat.{{ domain_name }}:9021"
-websub_event_receiver_https_endpoint = "https://api-uat.{{ domain_name }}:8021"
+ws_endpoint = "ws://{{ gw_domain }}:9099"
+wss_endpoint = "wss://{{ gw_domain }}:8099"
+http_endpoint = "http://{{ gw_domain }}:80"
+https_endpoint = "https://{{ gw_domain }}:443"
+websub_event_receiver_http_endpoint = "http://{{ gw_domain }}:9021"
+websub_event_receiver_https_endpoint = "https://{{ gw_domain }}:8021"
 
 [apim.sync_runtime_artifacts.gateway]
 gateway_labels =["Default"]
+
+[[oauth.extensions.token_types]]
+name = "JWT"
+issuer = "org.wso2.is.key.manager.tokenpersistence.issuer.ExtendedJWTTokenIssuer"
 
 #[apim.cache.gateway_token]
 #enable = true
@@ -113,9 +127,11 @@ gateway_labels =["Default"]
 #[apim.cache.tags]
 #expiry_time = "2m"
 
+# Writes one event per API call to repository/logs/apim_metrics.log,
+# which Fluent Bit ships to OpenSearch
 [apim.analytics]
-enable = true
-type = "elk"
+enable = {{ fluent_bit_install | bool | lower }}
+type = "opensearch"
 
 [apim.ai]
 enable = false
@@ -158,7 +174,7 @@ enable_lightweight_apikey_generation = true
 #enable_token_hashing = false
 
 [apim.devportal]
-url = "https://am-uat.{{ domain_name }}:${mgt.transport.https.port}/devportal"
+url = "https://{{ cp_domain }}/devportal"
 #enable_application_sharing = false
 #if application_sharing_type, application_sharing_impl both defined priority goes to application_sharing_impl
 #application_sharing_type = "default" #changed type, saml, default #todo: check the new config for rest api
@@ -181,18 +197,18 @@ allow_methods = ["GET","PUT","POST","DELETE","PATCH","OPTIONS"]
 allow_headers = ["authorization","Access-Control-Allow-Origin","Content-Type","SOAPAction","apikey","Internal-Key"]
 allow_credentials = false
 
+# Throttling sync: every node publishes throttle events to all Traffic
+# Managers and duplicates JMS events to the other node(s).
 [apim.throttling]
-event_duplicate_url = ["tcp://{{ groups['apim'][0] }}:5672"]
+event_duplicate_url = [{% for ip in other_nodes %}"tcp://{{ ip }}:5672"{{ ", " if not loop.last }}{% endfor %}]
 
+{% for ip in all_nodes %}
 [[apim.throttling.url_group]]
-traffic_manager_urls = ["tcp://{{ groups['apim'][0] }}:9611"]
-traffic_manager_auth_urls = ["ssl://{{ groups['apim'][0] }}:9711"]
-
-[[apim.throttling.url_group]]
-traffic_manager_urls = ["tcp://{{ groups['apim'][1] }}:9611"]
-traffic_manager_auth_urls = ["ssl://{{ groups['apim'][1] }}:9711"]
+traffic_manager_urls = ["tcp://{{ ip }}:9611"]
+traffic_manager_auth_urls = ["ssl://{{ ip }}:9711"]
 type = "loadbalance"
 
+{% endfor %}
 #[apim.workflow]
 #enable = false
 #service_url = "https://localhost:9445/bpmn"
@@ -245,7 +261,7 @@ subscriptions=["POST_ADD_USER"]
 sp_name_regex = "^[\\sa-zA-Z0-9._-]*$"
 
 [database.local]
-url = "jdbc:h2:./repository/database/WSO2CARBON_DB;DB_CLOSE_ON_EXIT=FALSE"
+url = "jdbc:h2:./repository/database/WSO2CARBON_DB;DB_CLOSE_ON_EXIT=FALSE;DB_CLOSE_DELAY=-1"
 
 [[event_listener]]
 id = "token_revocation"
@@ -282,4 +298,6 @@ iat_validity_period = "1h"
 [apim.cache_invalidation]
 enabled = true
 
-
+# Same key on every node (APIM would otherwise generate a different one per node)
+[encryption]
+key = "{{ apim_encryption_key }}"

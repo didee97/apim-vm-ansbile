@@ -1,0 +1,28 @@
+---
+# Runs from a `serial: 1` play, so nodes come up one after the other
+- name: Start APIM (restart if its config changed)
+  ansible.builtin.systemd:
+    name: wso2-apim
+    state: "{{ 'restarted' if apim_config_restart_needed | default(false) else 'started' }}"
+    daemon_reload: true
+
+- name: Wait for APIM to answer on 9443
+  ansible.builtin.uri:
+    url: "https://127.0.0.1:9443/services/Version"
+    validate_certs: false
+    status_code: [200]
+  register: apim_config_up
+  retries: "{{ (apim_start_timeout / 10) | int }}"
+  delay: 10
+  until: apim_config_up is succeeded
+
+- name: Show access URLs
+  ansible.builtin.debug:
+    msg:
+      - "Publisher : https://{{ cp_domain }}/publisher"
+      - "DevPortal : https://{{ cp_domain }}/devportal"
+      - "Admin     : https://{{ cp_domain }}/admin"
+      - "Carbon    : https://{{ cp_domain }}/carbon"
+      - "Gateway   : https://{{ gw_domain }}"
+      - "Add to your DNS or /etc/hosts:  {{ gateway_ip }} {{ cp_domain }} {{ gw_domain }}"
+  when: inventory_hostname == ansible_play_hosts_all[-1]

@@ -1,0 +1,44 @@
+---
+# Ubuntu's needrestart restarts every service that uses an updated library
+# after any apt run. With APIM that means both nodes restart at the same time
+# (an outage), e.g. after a security update. Never let it restart APIM; restart
+# it yourself, one node at a time (./deploy.sh -- --tags apim_config).
+# Done first, before any apt task on the APIM nodes.
+- name: Never let needrestart restart WSO2 APIM automatically
+  when: inventory_hostname in groups['apim']
+  block:
+    - name: Create needrestart config directory
+      ansible.builtin.file:
+        path: /etc/needrestart/conf.d
+        state: directory
+        mode: "0755"
+
+    - name: Add needrestart rule for wso2-apim
+      ansible.builtin.copy:
+        dest: /etc/needrestart/conf.d/wso2-apim.conf
+        mode: "0644"
+        content: |
+          # Managed by Ansible (apim-vm-ansbile, roles/common).
+          # Both APIM nodes would otherwise restart together after an apt upgrade.
+          $nrconf{override_rc}{qr(^wso2-apim\.service$)} = 0;
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - acl            # lets Ansible become non-root users (e.g. postgres)
+      - unzip
+      - curl
+      - ca-certificates
+      - python3-debian   # needed by deb822_repository (Fluent Bit / SQL Server repos)
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Point control-plane and gateway domains to the gateway IP
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: '\s{{ cp_domain | regex_escape }}(\s|$)'
+    line: "{{ gateway_ip }} {{ cp_domain }} {{ gw_domain }}"
+    state: present
+    unsafe_writes: true   # /etc/hosts is a bind mount in containers (test lab)
+  when: inventory_hostname in groups['apim']

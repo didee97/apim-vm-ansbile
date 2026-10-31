@@ -1,0 +1,63 @@
+---
+- name: Install MySQL
+  ansible.builtin.apt:
+    name:
+      - mysql-server
+      - python3-pymysql
+    state: present
+
+- name: Allow remote connections
+  ansible.builtin.lineinfile:
+    path: /etc/mysql/mysql.conf.d/mysqld.cnf
+    regexp: '^\s*bind-address'
+    line: "bind-address = 0.0.0.0"
+  notify: Restart mysql
+
+- name: Start MySQL
+  ansible.builtin.systemd:
+    name: mysql
+    state: started
+    enabled: true
+
+- name: Flush handlers (apply bind-address now)
+  ansible.builtin.meta: flush_handlers
+
+- name: Create databases
+  ansible.mysql.mysql_db:
+    name: "{{ item }}"
+    encoding: utf8mb4
+    state: present
+    login_unix_socket: /run/mysqld/mysqld.sock
+  loop: ["{{ apim_db_name }}", "{{ shared_db_name }}"]
+
+- name: Create DB user with privileges on both databases
+  ansible.mysql.mysql_user:
+    name: "{{ db_user }}"
+    password: "{{ db_password }}"
+    host: "%"
+    priv: "{{ apim_db_name }}.*:ALL/{{ shared_db_name }}.*:ALL"
+    state: present
+    login_unix_socket: /run/mysqld/mysqld.sock
+  no_log: true
+
+- name: Count existing tables
+  ansible.mysql.mysql_query:
+    query: SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema = %s
+    positional_args: ["{{ item.db }}"]
+    login_unix_socket: /run/mysqld/mysqld.sock
+  loop:
+    - { db: "{{ apim_db_name }}", sql: apim.sql }
+    - { db: "{{ shared_db_name }}", sql: shared.sql }
+  register: db_table_count
+  changed_when: false
+
+- name: Import SQL scripts into empty databases
+  ansible.mysql.mysql_db:
+    name: "{{ item.item.db }}"
+    state: import
+    target: "{{ sql_dir }}/{{ item.item.sql }}"
+    login_unix_socket: /run/mysqld/mysqld.sock
+  loop: "{{ db_table_count.results }}"
+  loop_control:
+    label: "{{ item.item.db }}"
+  when: item.query_result[0][0].n | int == 0

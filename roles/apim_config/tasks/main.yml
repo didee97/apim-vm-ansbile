@@ -1,0 +1,46 @@
+---
+- name: Deploy deployment.toml
+  ansible.builtin.template:
+    src: deployment.toml.j2
+    dest: "{{ apim_home }}/repository/conf/deployment.toml"
+    owner: "{{ apim_user }}"
+    group: "{{ apim_user }}"
+    mode: "0600"
+  register: apim_config_cfg_1
+
+- name: Copy load balancer certificate ({{ ssl_mode }})
+  ansible.builtin.copy:
+    src: "{{ ssl_cert_src }}"
+    dest: "{{ apim_home }}/repository/resources/security/apim-lb.crt"
+    owner: "{{ apim_user }}"
+    group: "{{ apim_user }}"
+    mode: "0644"
+
+# Nodes call the control-plane / gateway domains through Nginx, so they
+# must trust its certificate.
+- name: Import load balancer certificate into client-truststore
+  community.general.java_cert:
+    cert_path: "{{ apim_home }}/repository/resources/security/apim-lb.crt"
+    keystore_path: "{{ apim_home }}/repository/resources/security/client-truststore.jks"
+    keystore_pass: wso2carbon
+    cert_alias: apim-lb
+    executable: "{{ java_home }}/bin/keytool"
+    state: present
+  register: apim_config_cfg_2
+
+- name: Install systemd unit
+  ansible.builtin.template:
+    src: wso2-apim.service.j2
+    dest: /etc/systemd/system/wso2-apim.service
+    mode: "0644"
+  register: apim_config_cfg_3
+
+- name: Enable APIM service
+  ansible.builtin.systemd:
+    name: wso2-apim
+    enabled: true
+    daemon_reload: true
+
+- name: Remember whether a restart is needed
+  ansible.builtin.set_fact:
+    apim_config_restart_needed: "{{ [apim_config_cfg_1, apim_config_cfg_2, apim_config_cfg_3] | selectattr('changed') | list | length > 0 }}"

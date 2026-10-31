@@ -1,0 +1,236 @@
+---
+# WSO2 API Manager HA on 4 VMs:
+#   db   - PostgreSQL / MySQL / SQL Server (chosen in ./configure.sh)
+#   lb   - Nginx, SSL termination for the control-plane and gateway domains
+#   apim - two all-in-one APIM nodes with throttling event sync between them
+#
+# Run `./deploy.sh` (it asks the questions on first run, then runs this file).
+# Tags: preflight, ssl, apim_install, db, nginx, apim_config, apim_start, fluent_bit
+
+############################################
+# PREFLIGHT + SSL CERTIFICATE (controller)
+############################################
+- name: Preflight checks and SSL certificate
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [preflight, ssl]
+
+  tasks:
+    - name: Check configuration exists
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - db_type is defined
+          - cp_domain is defined
+          - groups['db'] | default([]) | length == 1
+          - groups['lb'] | default([]) | length == 1
+          - groups['apim'] | default([]) | length == 2
+        fail_msg: "No configuration found. Run: ansible-playbook configure.yml (or ./deploy.sh)"
+
+    - name: Check DB type
+      ansible.builtin.assert:
+        quiet: true
+        that: db_type in db_profiles
+        fail_msg: "db_type must be one of {{ db_profiles.keys() | list }}"
+
+    - name: Check SQL Server EULA
+      ansible.builtin.assert:
+        quiet: true
+        that: mssql_accept_eula | default(false) | bool
+        fail_msg: "SQL Server needs its licence terms accepted (run ./configure.sh, step 3)"
+      when: db_type == 'mssql'
+
+    # The key and certificate are files on this PC, not the VMs, so they are
+    # created even in a dry run (--check): later steps need to read them.
+    # Runs even with --tags, so later plays can always read the key file
+    - name: Create the shared APIM encryption key (only if missing)
+      ansible.builtin.copy:
+        dest: "{{ apim_encryption_key_file }}"
+        content: "{{ lookup('ansible.builtin.password', '/dev/null', length=64, chars=['0123456789abcdef']) }}\n"
+        mode: "0600"
+        force: false
+      check_mode: false
+      tags: [always]
+
+    - name: Create local SSL directory
+      ansible.builtin.file:
+        path: "{{ ssl_local_dir }}"
+        state: directory
+        mode: "0700"
+      check_mode: false
+
+    - name: Generate self-signed certificate
+      when: ssl_mode == 'selfsigned'
+      check_mode: false
+      block:
+        - name: Generate private key
+          community.crypto.openssl_privatekey:
+            path: "{{ ssl_local_dir }}/apim.key"
+            size: 2048
+            mode: "0600"
+
+        - name: Generate CSR
+          community.crypto.openssl_csr_pipe:
+            privatekey_path: "{{ ssl_local_dir }}/apim.key"
+            common_name: "{{ cp_domain }}"
+            subject_alt_name:
+              - "DNS:{{ cp_domain }}"
+              - "DNS:{{ gw_domain }}"
+          register: csr
+          changed_when: false
+
+        - name: Generate self-signed certificate (regenerated when domains change)
+          community.crypto.x509_certificate:
+            path: "{{ ssl_local_dir }}/apim.crt"
+            csr_content: "{{ csr.csr }}"
+            privatekey_path: "{{ ssl_local_dir }}/apim.key"
+            provider: selfsigned
+            selfsigned_not_after: "+{{ ssl_selfsigned_days }}d"
+            mode: "0644"
+
+    - name: Read certificate
+      community.crypto.x509_certificate_info:
+        path: "{{ ssl_cert_src }}"
+      register: cert_info
+
+    - name: Read private key
+      community.crypto.openssl_privatekey_info:
+        path: "{{ ssl_key_src }}"
+      register: key_info
+
+    - name: Check certificate matches key and covers both domains
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - cert_info.public_key == key_info.public_key
+          - not cert_info.expired
+          - cp_domain in sans or ('*.' ~ cp_domain.split('.', 1)[1]) in sans
+          - gw_domain in sans or ('*.' ~ gw_domain.split('.', 1)[1]) in sans
+        fail_msg: >-
+          Certificate problem: key matches={{ cert_info.public_key == key_info.public_key }},
+          expired={{ cert_info.expired }}, SANs={{ sans }}.
+          The certificate must cover {{ cp_domain }} and {{ gw_domain }}.
+      vars:
+        sans: "{{ cert_info.subject_alt_name | default([], true) | select('match', 'DNS:') | map('regex_replace', '^DNS:', '') | list }}"
+
+############################################
+# DRY RUN ON NEW VMs (--check)
+############################################
+# A dry run installs nothing, so on VMs that never had APIM the later steps
+# (packages, unzip, SQL import, config files) have nothing to work on; even
+# previewing package installs needs python3-apt, which minimal images lack.
+# Stop here with a clear message instead of failing on the first missing piece.
+- name: Dry run - is APIM installed yet?
+  hosts: apim
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Look for an existing APIM install
+      ansible.builtin.stat:
+        path: "{{ apim_home }}/bin/api-manager.sh"
+      register: apim_installed
+      when: ansible_check_mode
+
+    - name: Stop the dry run here on new VMs
+      when:
+        - ansible_check_mode
+        - (ansible_play_hosts_all | map('extract', hostvars, ['apim_installed', 'stat', 'exists']) | select | list | length)
+          < (ansible_play_hosts_all | length)
+      run_once: true
+      block:
+        - name: Explain why the dry run stops here
+          ansible.builtin.debug:
+            msg:
+              - "DRY RUN STOPS HERE: WSO2 APIM is not installed on these VMs yet."
+              - "A dry run changes nothing, so the next steps (unzip APIM, import the SQL, write config)"
+              - "would have nothing to work on. Above you can see the files prepared on this PC"
+              - "(encryption key, certificate). Nothing was changed on the VMs."
+              - "To deploy for real: ./deploy.sh   |   To rehearse everything first: test/lab/lab.sh test"
+
+        - name: Skip the remaining steps
+          ansible.builtin.set_fact:
+            dry_run_stop: true
+          delegate_to: localhost
+          delegate_facts: true
+
+############################################
+# COMMON (all VMs)
+############################################
+- name: Common setup
+  hosts: db:lb:apim
+  become: true
+  roles:
+    - role: common
+      when: not (hostvars['localhost'].dry_run_stop | default(false))
+
+############################################
+# WSO2 APIM INSTALL (zip also provides the SQL scripts)
+############################################
+- name: Install WSO2 APIM binaries
+  hosts: apim
+  become: true
+  tags: [apim_install]
+  roles:
+    - role: apim_install
+      when: not (hostvars['localhost'].dry_run_stop | default(false))
+
+############################################
+# DATABASE
+############################################
+- name: Database setup (PostgreSQL, MySQL or SQL Server)
+  hosts: db
+  become: true
+  tags: [db]
+  roles:
+    - role: db
+      when: not (hostvars['localhost'].dry_run_stop | default(false))
+
+############################################
+# NGINX LOAD BALANCER
+############################################
+- name: Nginx setup
+  hosts: lb
+  become: true
+  tags: [nginx]
+  roles:
+    - role: nginx
+      when: not (hostvars['localhost'].dry_run_stop | default(false))
+
+############################################
+# FLUENT BIT -> OPENSEARCH (optional)
+# Before APIM starts: installing packages afterwards could trigger restarts.
+############################################
+- name: Fluent Bit for API analytics
+  hosts: apim
+  become: true
+  tags: [fluent_bit]
+  roles:
+    - role: fluent_bit
+      when:
+        - fluent_bit_install | bool
+        - not (hostvars['localhost'].dry_run_stop | default(false))
+
+############################################
+# WSO2 APIM CONFIGURE + START
+############################################
+- name: Configure and start WSO2 APIM
+  hosts: apim
+  become: true
+  tags: [apim_config]
+  roles:
+    - role: apim_config
+      when: not (hostvars['localhost'].dry_run_stop | default(false))
+
+- name: Start WSO2 APIM nodes one at a time
+  hosts: apim
+  become: true
+  serial: 1
+  gather_facts: false
+  tags: [apim_config, apim_start]
+  tasks:
+    - name: Start node
+      ansible.builtin.include_role:
+        name: apim_config
+        tasks_from: start.yml
+      when: not (hostvars['localhost'].dry_run_stop | default(false))

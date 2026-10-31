@@ -1,0 +1,85 @@
+---
+- name: Create apt keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Add Fluent Bit signing key
+  ansible.builtin.get_url:
+    url: https://packages.fluentbit.io/fluentbit.key
+    dest: /etc/apt/keyrings/fluentbit.asc
+    mode: "0644"
+
+- name: Add Fluent Bit repository
+  ansible.builtin.deb822_repository:
+    name: fluent-bit
+    types: deb
+    uris: "https://packages.fluentbit.io/ubuntu/{{ ansible_facts.distribution_release }}"
+    suites: "{{ ansible_facts.distribution_release }}"
+    components: main
+    signed_by: /etc/apt/keyrings/fluentbit.asc
+
+# Left behind by older versions of this playbook (apt_repository)
+- name: Remove old-style Fluent Bit repository file
+  ansible.builtin.file:
+    path: /etc/apt/sources.list.d/fluent-bit.list
+    state: absent
+
+- name: Install Fluent Bit
+  ansible.builtin.apt:
+    name: fluent-bit
+    state: present
+    update_cache: true
+
+- name: Create Fluent Bit state directory
+  ansible.builtin.file:
+    path: /var/lib/fluent-bit
+    state: directory
+    mode: "0755"
+
+# Same check as `curl -sk -u admin:... https://<os>:9200`
+- name: Check OpenSearch is reachable with these credentials
+  ansible.builtin.uri:
+    url: "https://{{ opensearch_host }}:{{ opensearch_port }}"
+    url_username: "{{ opensearch_user }}"
+    url_password: "{{ opensearch_password }}"
+    force_basic_auth: true
+    validate_certs: "{{ opensearch_tls_verify | bool }}"
+    timeout: 15
+  register: fluent_bit_os_check
+  failed_when: false
+  check_mode: false   # read-only GET, so also run it in a dry run
+  no_log: true
+
+- name: Report OpenSearch connection problem
+  ansible.builtin.fail:
+    msg: >-
+      Cannot reach OpenSearch at https://{{ opensearch_host }}:{{ opensearch_port }} as {{ opensearch_user }}
+      (status {{ fluent_bit_os_check.status | default('n/a') }}: {{ fluent_bit_os_check.msg | default('') }}).
+      401 = wrong password; -1/timeout = firewall (allow this node to port {{ opensearch_port }} on the
+      logging VM) or wrong host; certificate error = set TLS verify to n in configure.yml.
+  when: fluent_bit_os_check.status | default(-1) != 200
+
+- name: Deploy WSO2 metrics parsers
+  ansible.builtin.template:
+    src: apim-parsers.conf.j2
+    dest: /etc/fluent-bit/apim-parsers.conf
+    mode: "0644"
+  notify: Restart fluent-bit
+
+# Holds the OpenSearch password, so root-only
+- name: Deploy Fluent Bit configuration
+  ansible.builtin.template:
+    src: fluent-bit.conf.j2
+    dest: /etc/fluent-bit/fluent-bit.conf
+    mode: "0600"
+    backup: true
+    validate: /opt/fluent-bit/bin/fluent-bit --dry-run -c %s
+  notify: Restart fluent-bit
+
+- name: Start Fluent Bit
+  ansible.builtin.systemd:
+    name: fluent-bit
+    state: started
+    enabled: true

@@ -1,0 +1,77 @@
+# {{ ansible_managed }}
+# WSO2 API-M analytics -> OpenSearch (WSO2 OpenSearch Analytics guide),
+# plus an env tag so several environments can share one OpenSearch.
+@SET APIM_HOME={{ apim_home }}
+@SET OS_HOST={{ opensearch_host }}
+@SET OS_PASSWORD={{ opensearch_password }}
+@SET ENV={{ apim_env }}
+
+[SERVICE]
+    Flush               1
+    Daemon              Off
+    Log_Level           info
+    Parsers_File        /etc/fluent-bit/apim-parsers.conf
+
+# --- INPUT: APIM Metrics ---
+[INPUT]
+    Name                tail
+    Tag                 apim.metrics
+    Path                ${APIM_HOME}/repository/logs/apim_metrics.log
+    Refresh_Interval    5
+    Buffer_Chunk_Size   32KB
+    Buffer_Max_Size     2MB
+    Mem_Buf_Limit       {{ fluent_bit_mem_buf_limit }}
+    Read_from_Head      true
+    DB                  /var/lib/fluent-bit/metrics-tail-status.db
+
+# --- FILTERS for APIM Metrics ---
+[FILTER]
+    Name                parser
+    Match               apim.metrics
+    Key_Name            log
+    Parser              apim_metrics_parser
+    Reserve_Data        On
+    Preserve_Key        Off
+
+[FILTER]
+    Name                parser
+    Match               apim.metrics
+    Key_Name            properties
+    Parser              jsonparser
+    Reserve_Data        On
+    Preserve_Key        Off
+
+[FILTER]
+    Name                rewrite_tag
+    Match               apim.metrics
+    Rule                $apimMetrics   ^apim:response$   metrics.response   false
+
+[FILTER]
+    Name                rewrite_tag
+    Match               apim.metrics
+    Rule                $apimMetrics   ^apim:faulty$     metrics.faulty     false
+
+# --- Environment tag (not in WSO2's guide) ---
+[FILTER]
+    Name                record_modifier
+    Match               metrics.*
+    Record              env ${ENV}
+{% for name, prefix in [('Response', opensearch_response_index_prefix), ('Faulty', opensearch_faulty_index_prefix)] %}
+
+# --- OUTPUT: Metrics {{ name }} ---
+[OUTPUT]
+    Name                opensearch
+    Match               metrics.{{ name | lower }}
+    Host                ${OS_HOST}
+    Port                {{ opensearch_port }}
+    HTTP_User           {{ opensearch_user }}
+    HTTP_Passwd         ${OS_PASSWORD}
+    Logstash_Format     On
+    Logstash_DateFormat %Y-%m-%d
+    Logstash_Prefix     {{ prefix }}
+    Replace_Dots        On
+    Suppress_Type_Name  On
+    tls                 On
+    tls.verify          {{ 'On' if opensearch_tls_verify | bool else 'Off' }}
+    Trace_Error         On
+{% endfor %}

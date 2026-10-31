@@ -1,0 +1,34 @@
+---
+# Runs every item of `checks` ({name, cmd, hint?, secret?, skip?}) on the host
+# and prints PASS/FAIL per check. Failures are stored in `hc_failed` and
+# reported by the summary play at the end, so one failing VM never stops the
+# checks on the others.
+- name: Run health checks
+  ansible.builtin.shell: "{{ item.cmd }}"
+  args:
+    executable: /bin/bash
+  loop: >-
+    {{ (checks | selectattr('skip', 'undefined') | list)
+       + (checks | selectattr('skip', 'defined') | rejectattr('skip') | list) }}
+  loop_control:
+    label: "{{ item.name }}"
+  register: hc
+  changed_when: false
+  failed_when: false
+  no_log: "{{ item.secret | default(false) }}"
+
+- name: Results
+  ansible.builtin.debug:
+    msg: >-
+      {{ hc.results | map(attribute='rc') | map('string')
+         | map('regex_replace', '^0$', 'PASS  ') | map('regex_replace', '^-?[0-9]+$', 'FAIL  ')
+         | zip(hc.results | map(attribute='item.name')) | map('join') | list }}
+
+- name: Remember failed checks
+  ansible.builtin.set_fact:
+    hc_failed: >-
+      {{ failed | map(attribute='name')
+         | zip(failed | map(attribute='hint', default='see the Results above'))
+         | map('join', '  ->  ') | list }}
+  vars:
+    failed: "{{ hc.results | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list }}"

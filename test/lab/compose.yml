@@ -1,0 +1,61 @@
+# 4 "VMs" on one machine. Same roles as the real layout: db, lb, apim1, apim2.
+# They talk to each other on 172.30.0.0/24. This machine reaches them only via
+# 127.0.0.1 ports (container IPs are not routable with rootless Docker).
+x-vm: &vm
+  build: .
+  image: apim-lab-vm:22.04
+  privileged: true            # systemd needs it
+  cgroup: host
+  tmpfs: [/run, /run/lock, /tmp]
+  volumes:
+    - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    - ./.ssh/id_ed25519.pub:/home/ubuntu/.ssh/authorized_keys:ro
+
+services:
+  db:
+    <<: *vm
+    hostname: lab-db
+    ports:
+      - "127.0.0.1:2210:22"
+    networks: { lab: { ipv4_address: 172.30.0.10 } }
+  lb:
+    <<: *vm
+    hostname: lab-lb
+    ports:
+      - "127.0.0.1:2211:22"
+      - "127.0.0.1:443:443"      # https://am.apim.localhost from this machine
+      - "127.0.0.1:80:80"
+    networks: { lab: { ipv4_address: 172.30.0.11 } }
+  apim1:
+    <<: *vm
+    hostname: lab-apim1
+    ports:
+      - "127.0.0.1:2212:22"
+    networks: { lab: { ipv4_address: 172.30.0.12 } }
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./.ssh/id_ed25519.pub:/home/ubuntu/.ssh/authorized_keys:ro
+      - ./.cache:/lab-cache:ro       # APIM zip downloaded once on the host
+  apim2:
+    <<: *vm
+    hostname: lab-apim2
+    ports:
+      - "127.0.0.1:2213:22"
+    networks: { lab: { ipv4_address: 172.30.0.13 } }
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./.ssh/id_ed25519.pub:/home/ubuntu/.ssh/authorized_keys:ro
+      - ./.cache:/lab-cache:ro
+  opensearch:                    # only started with --with-opensearch
+    profiles: [opensearch]
+    image: opensearchproject/opensearch:3.1.0
+    environment:
+      discovery.type: single-node
+      OPENSEARCH_INITIAL_ADMIN_PASSWORD: ${LAB_OS_PASSWORD:-}   # random, from .generated/lab-secrets.env
+      OPENSEARCH_JAVA_OPTS: -Xms512m -Xmx512m
+    networks: { lab: { ipv4_address: 172.30.0.20 } }
+
+networks:
+  lab:
+    ipam:
+      config: [{ subnet: 172.30.0.0/24 }]

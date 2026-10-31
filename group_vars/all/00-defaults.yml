@@ -1,0 +1,107 @@
+---
+# Static defaults. Values asked by `configure.yml` live in 10-config.yml and
+# 20-secrets.yml (generated, git-ignored) and override anything here.
+
+# IP other VMs use to reach a host (APIM <-> APIM, Nginx -> APIM, APIM -> DB).
+# Same as the SSH address unless set per host in the inventory.
+private_ip: "{{ ansible_host | default(inventory_hostname) }}"
+
+############################################
+# WSO2 API Manager
+############################################
+apim_version: "4.7.0"
+apim_zip_url: "https://github.com/wso2/product-apim/releases/download/v{{ apim_version }}/wso2am-{{ apim_version }}.zip"
+apim_base_dir: /opt/wso2
+apim_home: "{{ apim_base_dir }}/wso2am-{{ apim_version }}"
+apim_user: wso2
+apim_admin_user: admin
+
+# One [encryption] key shared by both nodes. They share a database, so they
+# must use the same key, or one node can't read secrets the other encrypted.
+# Created once on the controller by site.yml. BACK THIS FILE UP: losing it
+# makes the encrypted data in the database unreadable.
+apim_encryption_key_file: "{{ playbook_dir }}/files/apim-encryption.key"
+apim_encryption_key: "{{ lookup('ansible.builtin.file', apim_encryption_key_file) | trim }}"
+
+# APIM 4.7.0 refuses to start on anything other than Java 21-25
+java_package: openjdk-21-jdk-headless
+java_home: /usr/lib/jvm/java-21-openjdk-amd64
+apim_jvm_mem_opts: "-Xms512m -Xmx2048m"
+
+# Seconds to wait for each node's 9443 port after start
+apim_start_timeout: 600
+
+############################################
+# Databases
+############################################
+# db_type (postgres | mysql | mssql) is chosen in configure.yml
+db_user: wso2carbon
+db_host: "{{ hostvars[groups['db'][0]].private_ip }}"
+
+# Per-engine settings. SQL paths are relative to <APIM_HOME>/dbscripts and
+# are taken from the APIM zip itself, so they always match apim_version.
+db_profiles:
+  mysql:
+    port: 3306
+    toml_type: mysql
+    driver_class: com.mysql.cj.jdbc.Driver
+    driver_url: https://repo1.maven.org/maven2/com/mysql/mysql-connector-j/9.2.0/mysql-connector-j-9.2.0.jar
+    shared_sql: mysql.sql
+    apim_sql: apimgt/mysql.sql
+    apim_db_name: WSO2AM_DB
+    shared_db_name: WSO2AM_SHARED_DB
+  postgres:
+    port: 5432
+    toml_type: postgre
+    driver_class: org.postgresql.Driver
+    driver_url: https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar
+    shared_sql: postgresql.sql
+    apim_sql: apimgt/postgresql.sql
+    apim_db_name: wso2am_db
+    shared_db_name: wso2am_shared_db
+  mssql:
+    port: 1433
+    toml_type: mssql
+    driver_class: com.microsoft.sqlserver.jdbc.SQLServerDriver
+    driver_url: https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/12.8.1.jre11/mssql-jdbc-12.8.1.jre11.jar
+    shared_sql: mssql.sql
+    apim_sql: apimgt/mssql.sql
+    apim_db_name: WSO2AM_DB
+    shared_db_name: WSO2AM_SHARED_DB
+
+db: "{{ db_profiles[db_type] }}"
+apim_db_name: "{{ db.apim_db_name }}"
+shared_db_name: "{{ db.shared_db_name }}"
+
+# Where the controller keeps the SQL scripts pulled from the APIM zip
+dbscripts_cache: "{{ playbook_dir }}/.cache/dbscripts/{{ apim_version }}"
+# Where they are copied on the DB VM
+sql_dir: /opt/wso2-dbscripts
+
+# SQL Server: Microsoft repo release; 2022 supports Ubuntu 20.04 / 22.04
+mssql_release: "2022"
+
+############################################
+# Nginx / SSL
+############################################
+ssl_dir: /etc/nginx/ssl
+# Where self-signed certs are generated on the controller
+ssl_local_dir: "{{ playbook_dir }}/files/ssl"
+ssl_selfsigned_days: 825
+# ssl_mode is chosen in configure.yml. For "existing" it overrides these paths.
+ssl_cert_src: "{{ ssl_local_dir }}/apim.crt"
+ssl_key_src: "{{ ssl_local_dir }}/apim.key"
+
+############################################
+# Fluent Bit -> OpenSearch (API analytics)
+############################################
+# fluent_bit_install, apim_env and opensearch_* are asked in configure.yml
+apim_env: uat
+fluent_bit_install: false
+opensearch_port: 9200
+opensearch_user: admin
+opensearch_tls_verify: false
+# WSO2 default index prefixes (the WSO2 OpenSearch dashboards expect these)
+opensearch_response_index_prefix: apim_event_response
+opensearch_faulty_index_prefix: apim_event_faulty
+fluent_bit_mem_buf_limit: 256MB

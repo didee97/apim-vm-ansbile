@@ -1,0 +1,18 @@
+---
+- name: Create SQL script directory
+  ansible.builtin.file:
+    path: "{{ sql_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Copy SQL scripts from WSO2 APIM {{ apim_version }}
+  ansible.builtin.copy:
+    src: "{{ dbscripts_cache }}/{{ item.file }}"
+    dest: "{{ sql_dir }}/{{ item.name }}.sql"
+    mode: "0644"
+  loop:
+    - { name: shared, file: "{{ db.shared_sql }}" }
+    - { name: apim, file: "{{ db.apim_sql }}" }
+
+- name: Set up {{ db_type }}
+  ansible.builtin.include_tasks: "{{ db_type }}.yml"

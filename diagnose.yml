@@ -1,0 +1,89 @@
+---
+# Collects what's needed to find out why APIM isn't working, from every VM.
+# Read-only: nothing is changed.
+#
+#   ./deploy.sh --logs
+#
+# Paste the output when asking for help.
+
+- name: Diagnose APIM nodes
+  hosts: apim
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Collect APIM diagnostics
+      ansible.builtin.shell: |
+        L={{ apim_home }}/repository/logs/wso2carbon.log
+        echo "===== $(hostname) ({{ private_ip }})  $(date '+%F %T')"
+        echo "--- service"
+        systemctl show wso2-apim -p ActiveState -p SubState -p NRestarts -p ExecMainStartTimestamp -p ExecMainStatus
+        echo "--- java process (pid, memory MB, uptime)"
+        if pgrep -x java >/dev/null; then
+          ps -C java -o pid=,rss=,etime= | awk '{printf "%s  %d MB  up %s\n", $1, $2/1024, $3}'
+        else
+          echo "no java process"
+        fi
+        echo "--- memory and CPU"
+        free -m | sed -n '1,3p'; echo "CPUs: $(nproc)"
+        echo "--- killed for lack of memory? (kernel log)"
+        journalctl -k --no-pager 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -5 || true
+        echo "--- listening ports (9443 8243 8280 9611 9711 5672)"
+        ss -ltn | grep -E ':(9443|8243|8280|9611|9711|5672) ' || echo "none of them"
+        echo "--- startup markers in wso2carbon.log"
+        grep -E 'Starting WSO2 Carbon|WSO2 Carbon started in|Halting JVM|Shutdown hook triggered|Gracefully shutting down' "$L" 2>/dev/null | tail -8 | cut -c1-200
+        echo "--- last 15 ERRORs in wso2carbon.log"
+        grep -E ' ERROR ' "$L" 2>/dev/null | tail -15 | cut -c1-400
+        echo "--- last 25 lines of wso2carbon.log"
+        tail -25 "$L" 2>/dev/null | cut -c1-300
+        echo "--- who stopped/started APIM recently (systemd, needrestart, apt)"
+        journalctl --no-pager --since "-6h" 2>/dev/null \
+          | grep -E 'wso2-apim|needrestart|unattended-upgrade' | grep -vE 'api-manager.sh\[' | tail -10 | cut -c1-200
+        grep -h -E '^(Start-Date|Commandline|Install|Upgrade):' /var/log/apt/history.log 2>/dev/null | tail -8 | cut -c1-200
+        echo "--- needrestart protection for APIM"
+        cat /etc/needrestart/conf.d/wso2-apim.conf 2>/dev/null | grep -v '^#' || echo "not installed yet (re-run ./deploy.sh)"
+        echo "--- systemd journal (last 20)"
+        journalctl -u wso2-apim --no-pager -n 20 2>/dev/null | cut -c1-300
+        echo "--- JVM settings in use"
+        systemctl show wso2-apim -p Environment
+        echo "--- Java"
+        {{ java_home }}/bin/java -version 2>&1 | head -1
+      args:
+        executable: /bin/bash
+      register: diag
+      changed_when: false
+      failed_when: false
+
+    - name: APIM node diagnostics
+      ansible.builtin.debug:
+        msg: "{{ diag.stdout_lines }}"
+
+- name: Diagnose database and load balancer
+  hosts: db:lb
+  become: true
+  gather_facts: false
+  vars:
+    db_service: "{{ {'postgres': 'postgresql', 'mysql': 'mysql', 'mssql': 'mssql-server'}[db_type] }}"
+  tasks:
+    - name: Collect diagnostics
+      ansible.builtin.shell: |
+        echo "===== $(hostname) ({{ private_ip }})  groups: {{ group_names | join(',') }}"
+        free -m | sed -n '1,2p'; echo "CPUs: $(nproc)"
+        {% if 'db' in group_names %}
+        echo "--- {{ db_service }}: $(systemctl is-active {{ db_service }})"
+        journalctl -u {{ db_service }} --no-pager -n 5 2>/dev/null | cut -c1-200
+        {% endif %}
+        {% if 'lb' in group_names %}
+        echo "--- nginx: $(systemctl is-active nginx)"
+        tail -5 /var/log/nginx/cp_https_error.log 2>/dev/null | cut -c1-250
+        {% endif %}
+        echo "--- killed for lack of memory? (kernel log)"
+        journalctl -k --no-pager 2>/dev/null | grep -iE 'out of memory|oom-kill|killed process' | tail -3 || true
+      args:
+        executable: /bin/bash
+      register: diag
+      changed_when: false
+      failed_when: false
+
+    - name: Database / load balancer diagnostics
+      ansible.builtin.debug:
+        msg: "{{ diag.stdout_lines }}"

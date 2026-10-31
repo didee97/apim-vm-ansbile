@@ -1,0 +1,178 @@
+---
+# Health check for a deployed environment: real VMs or the test lab.
+#
+#   ansible-playbook healthcheck.yml                 (real VMs: inventory/hosts.ini)
+#   ./deploy.sh --healthcheck                        (same, via deploy.sh)
+#   test/lab/lab.sh healthcheck                      (test lab)
+#
+# Every check runs; each VM prints PASS/FAIL per check, and the run fails if
+# any check failed. Nothing is changed on the VMs.
+
+############################################
+# DATABASE VM
+############################################
+- name: Health check - database ({{ db_type | default('?') }})
+  hosts: db
+  become: true
+  gather_facts: false
+  vars:
+    db_service: "{{ {'postgres': 'postgresql', 'mysql': 'mysql', 'mssql': 'mssql-server'}[db_type] }}"
+    table_count_sql:
+      postgres: >-
+        cd /tmp && sudo -u postgres psql -tA -d DBNAME
+        -c "select count(*) from information_schema.tables where table_schema='public'"
+      mysql: >-
+        mysql -NB -e "select count(*) from information_schema.tables where table_schema='DBNAME'"
+      mssql: >-
+        SQLCMDPASSWORD='{{ mssql_sa_password | default('') }}' /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C
+        -h -1 -W -d DBNAME -Q 'set nocount on; select count(*) from sys.tables'
+    checks:
+      - name: "{{ db_service }} service is running"
+        cmd: systemctl is-active --quiet {{ db_service }}
+        hint: "sudo journalctl -u {{ db_service }} -n 50 on the DB VM"
+      - name: "listening on port {{ db.port }} for the APIM nodes"
+        cmd: ss -ltn | grep -qE '(0\.0\.0\.0|\*|\[::\]):{{ db.port }} '
+        hint: DB only listens on localhost; re-run site.yml --tags db
+      - name: "{{ apim_db_name }} has the APIM tables (> 100)"
+        cmd: test "$({{ table_count_sql[db_type] | replace('DBNAME', apim_db_name) }} | tr -dc 0-9)" -gt 100
+        hint: SQL import missing; re-run site.yml --tags apim_install,db
+        secret: "{{ db_type == 'mssql' }}"
+      - name: "{{ shared_db_name }} has the shared tables (> 20)"
+        cmd: test "$({{ table_count_sql[db_type] | replace('DBNAME', shared_db_name) }} | tr -dc 0-9)" -gt 20
+        hint: SQL import missing; re-run site.yml --tags apim_install,db
+        secret: "{{ db_type == 'mssql' }}"
+  tasks:
+    - name: Run checks
+      ansible.builtin.include_tasks: tasks/run-checks.yml
+
+############################################
+# APIM NODES
+############################################
+- name: Health check - APIM nodes
+  hosts: apim
+  become: true
+  gather_facts: false
+  vars:
+    other_ips: "{{ groups['apim'] | reject('equalto', inventory_hostname) | map('extract', hostvars) | map(attribute='private_ip') | list }}"
+    toml: "{{ apim_home }}/repository/conf/deployment.toml"
+    checks:
+      - name: wso2-apim service is running
+        cmd: systemctl is-active --quiet wso2-apim
+        hint: "sudo journalctl -u wso2-apim -n 50; tail {{ apim_home }}/repository/logs/wso2carbon.log"
+      - name: APIM answers on https://127.0.0.1:9443
+        cmd: test "$(curl -sk -m 10 -o /dev/null -w '%{http_code}' https://127.0.0.1:9443/services/Version)" = 200
+        hint: still starting (takes 2-3 min) or crashed; check wso2carbon.log
+      - name: gateway listening on 8243 (HTTPS) and 8280 (HTTP)
+        cmd: test "$(ss -ltn | grep -cE ':(8243|8280) ')" -ge 2
+      - name: throttling sync ports 9611, 9711, 5672 listening
+        cmd: test "$(ss -ltn | grep -cE ':(9611|9711|5672) ')" -ge 3
+      - name: "reaches other node(s) {{ other_ips | join(', ') }} on 9611 and 5672"
+        cmd: for ip in {{ other_ips | join(' ') }}; do for p in 9611 5672; do timeout 5 bash -c "</dev/tcp/$ip/$p" || exit 1; done; done
+        hint: other node down (see its checks) or firewall; allow 9611, 9711, 5672 both ways
+      - name: "reaches the database {{ db_host }}:{{ db.port }}"
+        cmd: timeout 5 bash -c '</dev/tcp/{{ db_host }}/{{ db.port }}'
+        hint: "firewall on the DB VM; allow port {{ db.port }} from the APIM nodes"
+      - name: "{{ cp_domain }} and {{ gw_domain }} resolve to the gateway IP {{ gateway_ip }}"
+        cmd: for d in {{ cp_domain }} {{ gw_domain }}; do getent ahostsv4 $d | head -1 | grep -q '^{{ gateway_ip }} ' || exit 1; done
+        hint: /etc/hosts entry missing; re-run site.yml
+      - name: "[encryption] key matches files/apim-encryption.key (same on all nodes)"
+        cmd: grep -A1 '^\[encryption\]' {{ toml }} | grep -qF '{{ apim_encryption_key }}'
+        hint: re-run site.yml --tags apim_config
+        secret: true
+      - name: fluent-bit service is running
+        cmd: systemctl is-active --quiet fluent-bit
+        hint: sudo journalctl -u fluent-bit -n 50
+        skip: "{{ not fluent_bit_install | bool }}"
+      - name: "fluent-bit can log in to OpenSearch {{ opensearch_host | default('') }}:{{ opensearch_port }}"
+        cmd: >-
+          test "$(curl -sk -m 10 -o /dev/null -w '%{http_code}' -u '{{ opensearch_user }}:{{ opensearch_password | default('') }}'
+          https://{{ opensearch_host | default('') }}:{{ opensearch_port }})" = 200
+        hint: "401 = wrong password; timeout = firewall on the OpenSearch VM (port {{ opensearch_port }})"
+        secret: true
+        skip: "{{ not fluent_bit_install | bool }}"
+  tasks:
+    - name: Run checks
+      ansible.builtin.include_tasks: tasks/run-checks.yml
+
+############################################
+# NGINX LOAD BALANCER
+############################################
+- name: Health check - Nginx load balancer
+  hosts: lb
+  become: true
+  gather_facts: false
+  vars:
+    apim_ips: "{{ groups['apim'] | map('extract', hostvars) | map(attribute='private_ip') | list }}"
+    via_nginx: curl -sk -m 15 -o /dev/null -w '%{http_code}' --resolve {{ cp_domain }}:443:127.0.0.1 --resolve {{ gw_domain }}:443:127.0.0.1
+    checks:
+      - name: nginx service is running
+        cmd: systemctl is-active --quiet nginx
+      - name: nginx configuration is valid
+        cmd: nginx -t
+      - name: "reaches every APIM node ({{ apim_ips | join(', ') }}) on 9443 and 8243"
+        cmd: for ip in {{ apim_ips | join(' ') }}; do for p in 9443 8243; do timeout 5 bash -c "</dev/tcp/$ip/$p" || exit 1; done; done
+        hint: an APIM node is down (see its checks) or firewall; allow 9443, 8243 from Nginx
+      - name: "https://{{ cp_domain }}/publisher works through Nginx"
+        cmd: "[[ $({{ via_nginx }} https://{{ cp_domain }}/publisher/) =~ ^(200|302)$ ]]"
+        hint: 502 = Nginx can't reach APIM; check the node checks
+      - name: "https://{{ cp_domain }}/devportal works through Nginx"
+        cmd: "[[ $({{ via_nginx }} https://{{ cp_domain }}/devportal/) =~ ^(200|302)$ ]]"
+      - name: Admin REST API login through Nginx (proves APIM <-> DB)
+        cmd: >-
+          curl -skf -m 15 --resolve {{ cp_domain }}:443:127.0.0.1 -u '{{ apim_admin_user }}:{{ apim_admin_password }}'
+          https://{{ cp_domain }}/api/am/admin/v4/throttling/policies/application | grep -q Unlimited
+        hint: wrong admin password, or APIM can't use its database
+        secret: true
+      - name: "https://{{ gw_domain }} gateway answers through Nginx (not 502/503/504)"
+        cmd: "[[ $({{ via_nginx }} https://{{ gw_domain }}/) =~ ^[2-4][0-9][0-9]$ ]]"
+  tasks:
+    - name: Run checks
+      ansible.builtin.include_tasks: tasks/run-checks.yml
+
+############################################
+# FROM THIS MACHINE (like a user's browser)
+############################################
+- name: Health check - from this machine
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    from_here: curl -sk -m 15 -o /dev/null -w '%{http_code}'
+    dns_hint: "this machine can't reach it: add DNS, or '{{ gateway_ip }} {{ cp_domain }} {{ gw_domain }}' to /etc/hosts"
+    checks:
+      - name: "{{ cp_domain }} resolves on this machine"
+        cmd: getent hosts {{ cp_domain }}
+        hint: "{{ dns_hint }}"
+      - name: "https://{{ cp_domain }}/publisher opens from this machine"
+        cmd: "[[ $({{ from_here }} https://{{ cp_domain }}/publisher/) =~ ^(200|302)$ ]]"
+        hint: "{{ dns_hint }}"
+      - name: "https://{{ gw_domain }} gateway answers from this machine"
+        cmd: "[[ $({{ from_here }} https://{{ gw_domain }}/) =~ ^[2-4][0-9][0-9]$ ]]"
+        hint: "{{ dns_hint }}"
+  tasks:
+    - name: Run checks
+      ansible.builtin.include_tasks: tasks/run-checks.yml
+
+############################################
+# SUMMARY (sets the exit code)
+############################################
+- name: Health check - summary
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    checked: "{{ (groups['db'] + groups['lb'] + groups['apim'] + ['localhost']) | select('in', hostvars) | list }}"
+    problems: >-
+      {{ dict(checked | zip(checked | map('extract', hostvars, 'hc_failed') | map('default', ['not checked (host unreachable?)'])))
+         | dict2items | rejectattr('value', 'equalto', []) | items2dict }}
+  tasks:
+    - name: Everything healthy
+      ansible.builtin.assert:
+        quiet: true
+        that: problems | length == 0
+        success_msg: "All services healthy on {{ checked | join(', ') }}"
+        fail_msg: "{{ 'FAILED CHECKS:' ~ '\n' ~ (problems | to_nice_yaml) }}"
+
+    - name: Everything healthy
+      ansible.builtin.debug:
+        msg: "ALL CHECKS PASSED on {{ checked | join(', ') }}"

@@ -1,0 +1,23 @@
+# {{ ansible_managed }}
+[Unit]
+Description=WSO2 API Manager {{ apim_version }}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ apim_user }}
+Group={{ apim_user }}
+Environment="JAVA_HOME={{ java_home }}"
+Environment="JVM_MEM_OPTS={{ apim_jvm_mem_opts }}"
+WorkingDirectory={{ apim_home }}
+# Runs in the foreground so systemd tracks the JVM directly
+ExecStart={{ apim_home }}/bin/api-manager.sh
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=120
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
