@@ -39,6 +39,8 @@
         quiet: true
         that:
           - cfg.db_type in ['postgres', 'mysql', 'mssql']
+          - cfg.apim_distribution | default('opensource') in ['opensource', 'licensed']
+          - cfg.apim_distribution | default('opensource') == 'opensource' or (cfg.apim_zip_src | default('') is file)
           - cfg.db_ip is match(ip_regex)
           - cfg.lb_ip is match(ip_regex)
           - cfg.node1_ip is match(ip_regex)
@@ -96,6 +98,7 @@
     - name: Summary
       ansible.builtin.debug:
         msg:
+          - "APIM package  : {{ 'licensed: ' ~ cfg.apim_zip_src if cfg.apim_distribution | default('opensource') == 'licensed' else 'open source (GitHub)' }}"
           - "Database      : {{ cfg.db_type }} on {{ cfg.db_ip }}"
           - "Load balancer : nginx on {{ cfg.lb_ip }}"
           - "APIM nodes    : {{ cfg.node1_ip }}, {{ cfg.node2_ip }} (throttling sync between them)"

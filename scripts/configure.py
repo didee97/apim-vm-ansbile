@@ -7,6 +7,7 @@ Current values are shown in [brackets]; press Enter to keep them.
 """
 import datetime
 import getpass
+import glob
 import ipaddress
 import json
 import os
@@ -14,6 +15,7 @@ import re
 import secrets
 import string
 import sys
+import zipfile
 
 import yaml
 
@@ -21,7 +23,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TTY = sys.stdout.isatty()
 BOLD, DIM, GREEN, RED, YELLOW, RESET = (
     ("\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[33m", "\033[0m") if TTY else ("",) * 6)
-STEPS = 7
+STEPS = 8
 DOMAIN_RE = re.compile(r"^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$")
 
 
@@ -241,8 +243,58 @@ An SSH key is easiest (no passwords to type). To set one up: ssh-copy-id <user>@
     a["sudo_ask"] = "y" if yes_no("Does sudo ask for a password on the VMs?", a.get("sudo_ask", "y") == "y") else "n"
 
 
+def find_apim_zip(path, version):
+    """Accepts a zip file or a folder holding it. Returns (zip_path, problem)."""
+    path = os.path.expanduser(path)
+    if os.path.isdir(path):
+        found = sorted(glob.glob(os.path.join(path, "wso2am-*.zip")))
+        if not found:
+            return None, f"No wso2am-*.zip file in {path}"
+        if len(found) > 1:
+            return None, ("Several WSO2 zips in that folder; give the file itself: "
+                          + ", ".join(os.path.basename(f) for f in found))
+        path = found[0]
+    if not os.path.isfile(path):
+        return None, f"File or folder not found on this PC: {path}"
+    try:
+        names = zipfile.ZipFile(path).namelist()
+    except (zipfile.BadZipFile, OSError) as e:
+        return None, f"Not a valid zip file ({e})."
+    top = f"wso2am-{version}/"
+    if f"{top}bin/api-manager.sh" not in names:
+        tops = sorted({n.split("/", 1)[0] for n in names if "/" in n})[:3]
+        return None, (f"This isn't a WSO2 API Manager {version} zip: expected a '{top}' folder with "
+                      f"bin/api-manager.sh inside (found: {', '.join(tops) or 'nothing'}).")
+    return os.path.abspath(path), None
+
+
+def step_package(a, version):
+    header(3, "WSO2 API Manager package", f"""
+Which WSO2 API Manager {version} build should be installed on the APIM nodes?
+  • Open source – downloaded from GitHub by each node (free, no updates)
+  • Licensed    – the zip from your WSO2 subscription (with updates), copied from this PC""")
+    a["apim_distribution"] = choose("Package:", [
+        ("opensource", "Open source (download from GitHub)"),
+        ("licensed", "Licensed – use the WSO2 zip I already have on this PC"),
+    ], a.get("apim_distribution", "opensource"))
+    if a["apim_distribution"] == "opensource":
+        a.pop("apim_zip_src", None)
+        return
+    print(f"  {DIM}Give the zip file, or the folder it is in (e.g. ~/wso2 with wso2am-{version}.zip inside).{RESET}")
+    while True:
+        answer = ask("WSO2 zip file or folder", a.get("apim_zip_src", ""), f"~/wso2/wso2am-{version}.zip")
+        zip_path, problem = find_apim_zip(answer, version)
+        if zip_path:
+            size = os.path.getsize(zip_path) / 1024 / 1024
+            print(f"    {GREEN}✓ {zip_path} ({size:.0f} MB) is a WSO2 API Manager {version} package.{RESET}")
+            a["apim_zip_src"] = zip_path
+            return
+        error(problem)
+        a.pop("apim_zip_src", None)
+
+
 def step_database(a, s):
-    header(3, "Database", """
+    header(4, "Database", """
 Which database should be installed on the database VM? The WSO2 tables are
 created from the SQL scripts that ship with APIM 4.7.0.""")
     a["db_type"] = choose("Database:", [
@@ -281,7 +333,7 @@ created from the SQL scripts that ship with APIM 4.7.0.""")
 
 
 def step_domains(a):
-    header(4, "Domain names", """
+    header(5, "Domain names", """
 Two names, both pointing to the load balancer:
   • Control-plane domain – people open Publisher, Developer Portal and Admin here
   • Gateway domain       – applications call your APIs here""")
@@ -296,7 +348,7 @@ Two names, both pointing to the load balancer:
 
 
 def step_ssl(a):
-    header(5, "SSL certificate", f"""
+    header(6, "SSL certificate", f"""
 HTTPS certificate for {a['cp_domain']} and {a['gw_domain']} on the load balancer.""")
     a["ssl_mode"] = choose("Certificate:", [
         ("selfsigned", "Create a self-signed certificate (fine for testing; browsers show a warning)"),
@@ -320,7 +372,7 @@ HTTPS certificate for {a['cp_domain']} and {a['gw_domain']} on the load balancer
 
 
 def step_wso2(a, s):
-    header(6, "WSO2 admin and environment", """
+    header(7, "WSO2 admin and environment", """
 The WSO2 super-admin logs in to Publisher, Developer Portal, Admin and Carbon.
 The environment name tags this deployment's analytics (e.g. uat, prod).""")
 
@@ -340,7 +392,7 @@ The environment name tags this deployment's analytics (e.g. uat, prod).""")
 
 
 def step_analytics(a, s):
-    header(7, "API analytics (optional)", """
+    header(8, "API analytics (optional)", """
 Fluent Bit can send every API call (success, errors, latency) from both APIM nodes
 to an OpenSearch server you already have, for the WSO2 analytics dashboards.""")
     a["fluent_bit_install"] = yes_no("Install Fluent Bit and send analytics to OpenSearch?",
@@ -376,31 +428,35 @@ def review(a, s):
         ("", "APIM nodes", f"{a['node1_ip']}, {a['node2_ip']}"),
         ("2", "SSH login", f"{a['ssh_user']} with " + (f"key {a['ssh_key']}" if a["ssh_key"] else "password (asked when deploying)")
          + (", sudo asks a password" if a["sudo_ask"] == "y" else "")),
-        ("3", "Database", db_names[a["db_type"]] + (f" {a['mssql_pid']} edition" if a["db_type"] == "mssql" else "")
+        ("3", "APIM package", "open source (from GitHub)" if a.get("apim_distribution", "opensource") == "opensource"
+         else f"licensed: {a.get('apim_zip_src', '?')}"),
+        ("4", "Database", db_names[a["db_type"]] + (f" {a['mssql_pid']} edition" if a["db_type"] == "mssql" else "")
          + f", wso2carbon password {pw('db_password')}"),
-        ("4", "Control plane", f"https://{a['cp_domain']}/publisher, /devportal, /admin"),
+        ("5", "Control plane", f"https://{a['cp_domain']}/publisher, /devportal, /admin"),
         ("", "Gateway", f"https://{a['gw_domain']}"),
         ("", "Domains point to", a["gateway_ip"]),
-        ("5", "SSL", "self-signed" if a["ssl_mode"] == "selfsigned" else f"{a['ssl_cert_src']} + {a['ssl_key_src']}"),
-        ("6", "WSO2 admin", f"admin, password {pw('apim_admin_password')}"),
+        ("6", "SSL", "self-signed" if a["ssl_mode"] == "selfsigned" else f"{a['ssl_cert_src']} + {a['ssl_key_src']}"),
+        ("7", "WSO2 admin", f"admin, password {pw('apim_admin_password')}"),
         ("", "Environment", a["apim_env"]),
-        ("7", "Analytics", (f"Fluent Bit → https://{a['opensearch_host']}:{a['opensearch_port']} as {a['opensearch_user']}, "
+        ("8", "Analytics", (f"Fluent Bit → https://{a['opensearch_host']}:{a['opensearch_port']} as {a['opensearch_user']}, "
                             f"password {pw('opensearch_password')}") if a["fluent_bit_install"] else "off"),
     ]
     for step, label, value in rows:
         print(f"  {DIM}{step:>1}{RESET} {label:<17} {value}")
     print()
     while True:
-        answer = input(f"  Save these settings? {BOLD}y{RESET} = save, 1-7 = change that step, q = quit without saving [y]: ").strip().lower() or "y"
+        answer = input(f"  Save these settings? {BOLD}y{RESET} = save, 1-{STEPS} = change that step, q = quit without saving [y]: ").strip().lower() or "y"
         if answer in ("y", "yes", "q") or (answer.isdigit() and 1 <= int(answer) <= STEPS):
             return answer
-        error("Type y, a step number 1-7, or q.")
+        error(f"Type y, a step number 1-{STEPS}, or q.")
 
 
 # ---------------------------------------------------------------- main
 def main():
     out_path = sys.argv[1]
     config, _ = load_yaml(os.path.join(REPO, "group_vars/all/10-config.yml"))
+    defaults, _ = load_yaml(os.path.join(REPO, "group_vars/all/00-defaults.yml"))
+    version = str(defaults.get("apim_version", "4.7.0"))
     current_secrets, vaulted = load_yaml(os.path.join(REPO, "group_vars/all/20-secrets.yml"))
     hosts, inv_vars = load_inventory()
 
@@ -415,15 +471,15 @@ def main():
         a["login_method"] = "key" if a["ssh_key"] else "password"
     s = {k: v for k, v in current_secrets.items() if v not in (None, "")}
 
-    print(f"{BOLD}WSO2 API Manager 4.7.0 – deployment settings{RESET}")
-    print(f"{DIM}7 short steps. Current values are in [brackets]: press Enter to keep them. Ctrl+C quits without saving.{RESET}")
+    print(f"{BOLD}WSO2 API Manager {version} – deployment settings{RESET}")
+    print(f"{DIM}{STEPS} short steps. Current values are in [brackets]: press Enter to keep them. Ctrl+C quits without saving.{RESET}")
     if vaulted:
         print(f"{YELLOW}! group_vars/all/20-secrets.yml is vault-encrypted, so passwords will be asked again and saved unencrypted;")
         print(f"  re-encrypt afterwards with: ansible-vault encrypt group_vars/all/20-secrets.yml{RESET}")
 
-    steps = {1: lambda: step_vms(a), 2: lambda: step_ssh(a), 3: lambda: step_database(a, s),
-             4: lambda: step_domains(a), 5: lambda: step_ssl(a), 6: lambda: step_wso2(a, s),
-             7: lambda: step_analytics(a, s)}
+    steps = {1: lambda: step_vms(a), 2: lambda: step_ssh(a), 3: lambda: step_package(a, version),
+             4: lambda: step_database(a, s), 5: lambda: step_domains(a), 6: lambda: step_ssl(a),
+             7: lambda: step_wso2(a, s), 8: lambda: step_analytics(a, s)}
     for n in range(1, STEPS + 1):
         steps[n]()
     while True:
@@ -436,6 +492,7 @@ def main():
         steps[int(choice)]()
 
     a.pop("login_method", None)
+    a.setdefault("apim_distribution", "opensource")
     a.setdefault("mssql_pid", "Developer")
     a.setdefault("mssql_accept_eula", False)
     with open(out_path, "w") as f:

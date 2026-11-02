@@ -10,7 +10,14 @@ private_ip: "{{ ansible_host | default(inventory_hostname) }}"
 # WSO2 API Manager
 ############################################
 apim_version: "4.7.0"
+# Package (asked in ./configure.sh):
+#   opensource - each node downloads apim_zip_url
+#   licensed   - apim_zip_src (the zip from your WSO2 subscription, on this PC) is copied to each node
+apim_distribution: opensource
+apim_zip_src: ""
 apim_zip_url: "https://github.com/wso2/product-apim/releases/download/v{{ apim_version }}/wso2am-{{ apim_version }}.zip"
+# Where the zip is kept on each node (open source keeps the original name)
+apim_zip_dest: "{{ apim_base_dir }}/wso2am-{{ apim_version }}{{ '-licensed' if apim_distribution == 'licensed' else '' }}.zip"
 apim_base_dir: /opt/wso2
 apim_home: "{{ apim_base_dir }}/wso2am-{{ apim_version }}"
 apim_user: wso2

@@ -77,7 +77,8 @@ Ubuntu 24.04 is expected to work, except with SQL Server, which needs
 | apim1, apim2 → OpenSearch | 9200 (only if you enable analytics) |
 
 The VMs also need internet access during the deploy. They download Java,
-APIM 4.7.0 (~540 MB) and the database packages.
+APIM 4.7.0 (~540 MB, unless you use your own licensed zip) and the database
+packages.
 
 ### Step 1 – Prepare the VMs
 
@@ -134,7 +135,7 @@ Run every command below from this folder.
 ./configure.sh
 ```
 
-You answer 7 short steps. Each step explains what it needs and gives an
+You answer 8 short steps. Each step explains what it needs and gives an
 example. Current values are shown in `[brackets]`; press Enter to keep them.
 A wrong answer (bad IP, missing file, a key that doesn't match the
 certificate…) is reported right away and asked again.
@@ -143,16 +144,17 @@ certificate…) is reported right away and asked again.
 |---|---|---|
 | 1. Your 4 VMs | IP of the database VM, Nginx VM, APIM node 1 and APIM node 2 | `10.0.0.10` … |
 | 2. SSH login | SSH user; SSH key or password; does sudo ask for a password | `ubuntu`, key `~/.ssh/id_ed25519` |
-| 3. Database | PostgreSQL, MySQL 8 or SQL Server 2022; password for the `wso2carbon` DB user (Enter = generate one). SQL Server also asks the edition, licence acceptance and `sa` password | `1` |
-| 4. Domain names | Control-plane domain (Publisher, DevPortal, Admin); gateway domain (API calls); the IP they point to, usually the Nginx VM | `am.example.com`, `api.example.com` |
-| 5. SSL certificate | Create a self-signed one, or use your own certificate + key files (it checks that they match and cover both domains) | `1` |
-| 6. WSO2 admin | Password for the `admin` user; environment name | `uat`, `prod` |
-| 7. Analytics | Install Fluent Bit and send API analytics to OpenSearch? If yes: OpenSearch IP, port, user and password | `y`, `10.0.0.50` |
+| 3. APIM package | **Open source** (each node downloads it from GitHub) or **licensed** (your WSO2 subscription zip). For licensed, give the zip file or the folder it is in, on your PC; it checks it is a WSO2 APIM 4.7.0 zip | `2`, `~/wso2/wso2am-4.7.0.zip` |
+| 4. Database | PostgreSQL, MySQL 8 or SQL Server 2022; password for the `wso2carbon` DB user (Enter = generate one). SQL Server also asks the edition, licence acceptance and `sa` password | `1` |
+| 5. Domain names | Control-plane domain (Publisher, DevPortal, Admin); gateway domain (API calls); the IP they point to, usually the Nginx VM | `am.example.com`, `api.example.com` |
+| 6. SSL certificate | Create a self-signed one, or use your own certificate + key files (it checks that they match and cover both domains) | `1` |
+| 7. WSO2 admin | Password for the `admin` user; environment name | `uat`, `prod` |
+| 8. Analytics | Install Fluent Bit and send API analytics to OpenSearch? If yes: OpenSearch IP, port, user and password | `y`, `10.0.0.50` |
 
 At the end you see all your answers:
 
 ```
-  Save these settings? y = save, 1-7 = change that step, q = quit without saving [y]:
+  Save these settings? y = save, 1-8 = change that step, q = quit without saving [y]:
 ```
 
 Your answers are saved in `inventory/hosts.ini`, `group_vars/all/10-config.yml`
@@ -229,7 +231,7 @@ what to look at.
 
 ### Step 7 – Open it
 
-**DNS.** Point both domains to the IP you gave in step 4 of the questions.
+**DNS.** Point both domains to the IP you gave in step 5 of the questions.
 Ask your DNS admin, or for a quick test add this line to `/etc/hosts` on
 your PC (`C:\Windows\System32\drivers\etc\hosts` on Windows):
 
@@ -247,7 +249,7 @@ your PC (`C:\Windows\System32\drivers\etc\hosts` on Windows):
 | Carbon console | `https://<control-plane domain>/carbon` |
 | Gateway (your apps call APIs here) | `https://<gateway domain>/<api-context>/<version>/` |
 
-Log in as `admin` with the password from step 6 of the questions. If you
+Log in as `admin` with the password from step 7 of the questions. If you
 chose a self-signed certificate, the browser warns once. Click *Advanced →
 Proceed*.
 
@@ -274,6 +276,7 @@ Dashboards (*Dashboards Management → Saved objects → Import*). Filter by
 |---|---|
 | Change a setting (IP, domain, password, certificate…) and apply it | `./configure.sh`, then `./deploy.sh` |
 | Change settings and deploy in one go | `./deploy.sh --reconfigure` |
+| Switch from open source to your licensed zip, or install a newer licensed zip | `./configure.sh` (step 3), then `./deploy.sh` (see [Changing the APIM package](#changing-the-apim-package)) |
 | See what a deploy would change, without changing anything | `./deploy.sh -- --check --diff` |
 | Check that everything is healthy | `./deploy.sh --healthcheck` |
 | Collect diagnostics when something is wrong (read-only) | `./deploy.sh --logs` |
@@ -288,7 +291,29 @@ Dashboards (*Dashboards Management → Saved objects → Import*). Filter by
 Running `./deploy.sh` again is safe. It only changes what differs, and APIM
 restarts only if its configuration changed.
 
-### Files to back up
+### Changing the APIM package
+
+Each APIM node remembers which zip it was installed from (a checksum in
+`/opt/wso2/wso2am-4.7.0/.installed-from`). When `./deploy.sh` gets a
+different zip, it reinstalls APIM on that node. That happens when you switch
+open source → licensed, or licensed → open source, or give a newer licensed
+zip with updates. It works on **one node at a time**, so the other node keeps
+serving:
+
+1. Stops APIM on the node.
+2. Moves the old install aside as a backup:
+   `/opt/wso2/wso2am-4.7.0-before-<date-time>`.
+3. Unzips the new package, adds the JDBC driver, and re-applies your
+   configuration (database, domains, certificate, throttling sync, shared
+   encryption key).
+4. Starts APIM and waits until it answers, then moves to the next node.
+
+Your database, encryption key and settings stay the same, so APIs, users,
+applications and subscriptions are kept. Once everything works, you can
+delete the `-before-` backup folders to free about 1 GB per node. If a
+licensed update needs database changes, WSO2 provides the scripts with the
+update, and this playbook does not run them.
+
 
 - `files/apim-encryption.key`: the encryption key both APIM nodes share. APIM
   encrypts secrets in the database with it. **If you lose it, that data can't
@@ -308,10 +333,10 @@ restarts only if its configuration changed.
 | `Missing sudo password` / `sudo: a password is required` | Answer **y** to "Does sudo ask for a password?" in `./configure.sh` step 2. |
 | `FAILED - RETRYING ... Wait for APIM to answer on 9443` | Normal while APIM starts (2–3 min per node). Only a problem if it runs out of retries; then check the APIM log (next row). |
 | APIM doesn't start | On that node: `sudo journalctl -u wso2-apim -n 50` and `sudo tail -100 /opt/wso2/wso2am-4.7.0/repository/logs/wso2carbon.log` |
-| `Cannot reach OpenSearch` | 401 = wrong OpenSearch password. Timeout = the OpenSearch VM's firewall doesn't allow the APIM nodes on port 9200. Certificate error = answer **n** to the certificate check in step 7. |
+| `Cannot reach OpenSearch` | 401 = wrong OpenSearch password. Timeout = the OpenSearch VM's firewall doesn't allow the APIM nodes on port 9200. Certificate error = answer **n** to the certificate check in step 8. |
 | Browser shows **502 Bad Gateway** | Nginx can't reach APIM: a node is down, or ports 9443/8243 are blocked. Run `./deploy.sh --healthcheck`. |
 | Domain doesn't open in the browser | DNS isn't set up yet. Add the `/etc/hosts` line from Step 7. |
-| Browser certificate warning | Expected with a self-signed certificate. Use your own certificate (questions, step 5) to avoid it. |
+| Browser certificate warning | Expected with a self-signed certificate. Use your own certificate (questions, step 6) to avoid it. |
 | `DRY RUN STOPS HERE` | Normal for a dry run on VMs where APIM isn't installed yet. |
 | SQL Server: `needs Ubuntu 20.04/22.04` | SQL Server 2022 doesn't support Ubuntu 24.04. Use 22.04 for the database VM, or PostgreSQL / MySQL. |
 | Strange Ansible errors after an upgrade | Delete `.venv/` and run again; it reinstalls a working Ansible. |
@@ -364,7 +389,7 @@ test/lab/lab.sh destroy
 |---|---|---|
 | `preflight`, `ssl` | your PC | Checks the settings; creates the shared encryption key and the self-signed certificate, or checks your certificate |
 | – | all | Base packages; on the APIM nodes, `/etc/hosts` points both domains to the gateway IP |
-| `apim_install` | apim | Java 21, a `wso2` service user, APIM 4.7.0 in `/opt/wso2`, the JDBC driver for your database |
+| `apim_install` | apim | Java 21, a `wso2` service user, APIM 4.7.0 in `/opt/wso2` (downloaded, or your licensed zip copied from your PC), the JDBC driver for your database |
 | `db` | db | Installs the database, opens it to the APIM nodes, creates the APIM and shared databases and the `wso2carbon` user, imports the WSO2 SQL scripts (only into empty databases) |
 | `nginx` | lb | HTTPS for both domains, load-balancing to both nodes (sticky sessions for the portals) |
 | `apim_config` | apim | `deployment.toml` (database, domains, throttling sync, analytics, shared encryption key), trusts the Nginx certificate, systemd service, starts node 1 and then node 2 |

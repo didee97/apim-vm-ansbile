@@ -34,6 +34,17 @@
         that: db_type in db_profiles
         fail_msg: "db_type must be one of {{ db_profiles.keys() | list }}"
 
+    - name: Check the licensed APIM zip is on this PC
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - apim_zip_src | length > 0
+          - apim_zip_src is file
+        fail_msg: >-
+          apim_distribution is 'licensed' but the WSO2 zip '{{ apim_zip_src }}' was not found on this PC.
+          Run ./configure.sh (step 3) and give the zip file or its folder.
+      when: apim_distribution == 'licensed'
+
     - name: Check SQL Server EULA
       ansible.builtin.assert:
         quiet: true

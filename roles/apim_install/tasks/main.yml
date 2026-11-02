@@ -20,25 +20,84 @@
     group: "{{ apim_user }}"
     mode: "0755"
 
-- name: Download WSO2 APIM {{ apim_version }}
+- name: Download open-source WSO2 APIM {{ apim_version }}
   ansible.builtin.get_url:
     url: "{{ apim_zip_url }}"
-    dest: "{{ apim_base_dir }}/wso2am-{{ apim_version }}.zip"
+    dest: "{{ apim_zip_dest }}"
     mode: "0644"
     timeout: 600
-  register: apim_install_zip
+  register: apim_install_download
   retries: 3
   delay: 10
-  until: apim_install_zip is succeeded
+  until: apim_install_download is succeeded
+  when: apim_distribution == 'opensource'
 
-- name: Unzip WSO2 APIM
+- name: Copy licensed zip from this PC for WSO2 APIM {{ apim_version }}
+  ansible.builtin.copy:
+    src: "{{ apim_zip_src }}"
+    dest: "{{ apim_zip_dest }}"
+    mode: "0644"
+  when: apim_distribution == 'licensed'
+
+# Each install records the checksum of the zip it came from, so a different
+# zip (open source <-> licensed, or a newer licensed build) is detected.
+- name: Checksum of the APIM zip
+  ansible.builtin.stat:
+    path: "{{ apim_zip_dest }}"
+    checksum_algorithm: sha256
+    get_checksum: true
+  register: apim_install_zip_stat
+
+- name: Look for an existing APIM install
+  ansible.builtin.stat:
+    path: "{{ apim_home }}/bin/api-manager.sh"
+  register: apim_install_existing
+
+- name: Read which zip the existing install came from
+  ansible.builtin.slurp:
+    src: "{{ apim_home }}/.installed-from"
+  register: apim_install_marker
+  failed_when: false
+  when: apim_install_existing.stat.exists
+
+- name: Decide whether APIM must be (re)installed
+  ansible.builtin.set_fact:
+    apim_install_fresh: "{{ not apim_install_existing.stat.exists }}"
+    # Installs made before this check existed have no marker; they came from the open-source zip.
+    apim_install_switch: >-
+      {{ apim_install_existing.stat.exists and (
+           (installed_from != '' and installed_from != zip_checksum)
+           or (installed_from == '' and apim_distribution == 'licensed')) }}
+  vars:
+    zip_checksum: "{{ apim_install_zip_stat.stat.checksum | default('') }}"
+    installed_from: "{{ (apim_install_marker.content | default('') | b64decode | trim).split(' ')[0] if apim_install_marker.content is defined else '' }}"
+
+- name: Unzip WSO2 APIM (new install)
   ansible.builtin.unarchive:
-    src: "{{ apim_base_dir }}/wso2am-{{ apim_version }}.zip"
+    src: "{{ apim_zip_dest }}"
     dest: "{{ apim_base_dir }}"
     remote_src: true
     owner: "{{ apim_user }}"
     group: "{{ apim_user }}"
-    creates: "{{ apim_home }}/bin/api-manager.sh"
+  when: apim_install_fresh | bool
+
+- name: Record which zip this install came from
+  ansible.builtin.copy:
+    dest: "{{ apim_home }}/.installed-from"
+    content: "{{ apim_install_zip_stat.stat.checksum }} {{ apim_distribution }} {{ apim_zip_dest | basename }}\n"
+    owner: "{{ apim_user }}"
+    group: "{{ apim_user }}"
+    mode: "0644"
+  # A switch writes the marker itself, after reinstalling (see apim_config/tasks/switch.yml)
+  when: not apim_install_switch | bool and not ansible_check_mode
+
+- name: Announce package switch
+  ansible.builtin.debug:
+    msg: >-
+      A different APIM zip ({{ apim_distribution }}) was given for this node. It will be reinstalled
+      one node at a time in the start step: stop, keep the old install as a backup, unzip, re-apply
+      the configuration, start.
+  when: apim_install_switch | bool
 
 - name: Download JDBC driver for {{ db_type }}
   ansible.builtin.get_url:

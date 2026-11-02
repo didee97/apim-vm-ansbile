@@ -1,0 +1,41 @@
+---
+# Reinstalls APIM on this node from a different zip (open source <-> licensed,
+# or a newer licensed build). Runs from the `serial: 1` start play, so the
+# other node keeps serving. Database, encryption key and settings are kept;
+# the old install is moved aside as a backup.
+- name: Stop APIM before switching package
+  ansible.builtin.systemd:
+    name: wso2-apim
+    state: stopped
+
+- name: Keep the old install as a backup
+  ansible.builtin.command:
+    argv: [mv, "{{ apim_home }}", "{{ apim_home }}-before-{{ now(fmt='%Y%m%d-%H%M%S') }}"]
+  changed_when: true
+
+- name: Unzip the new APIM package
+  ansible.builtin.unarchive:
+    src: "{{ apim_zip_dest }}"
+    dest: "{{ apim_base_dir }}"
+    remote_src: true
+    owner: "{{ apim_user }}"
+    group: "{{ apim_user }}"
+
+- name: Download JDBC driver for {{ db_type }}
+  ansible.builtin.get_url:
+    url: "{{ db.driver_url }}"
+    dest: "{{ apim_home }}/repository/components/lib/{{ db.driver_url | basename }}"
+    owner: "{{ apim_user }}"
+    group: "{{ apim_user }}"
+    mode: "0644"
+
+- name: Re-apply the APIM configuration
+  ansible.builtin.include_tasks: main.yml
+
+- name: Record which zip this install came from
+  ansible.builtin.copy:
+    dest: "{{ apim_home }}/.installed-from"
+    content: "{{ apim_install_zip_stat.stat.checksum }} {{ apim_distribution }} {{ apim_zip_dest | basename }}\n"
+    owner: "{{ apim_user }}"
+    group: "{{ apim_user }}"
+    mode: "0644"

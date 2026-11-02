@@ -1,5 +1,12 @@
 ---
 # Runs from a `serial: 1` play, so nodes come up one after the other
+
+- name: Switch to the new APIM package on this node
+  ansible.builtin.include_tasks: switch.yml
+  when:
+    - apim_install_switch | default(false) | bool
+    - not ansible_check_mode
+
 - name: Start APIM (restart if its config changed)
   ansible.builtin.systemd:
     name: wso2-apim
