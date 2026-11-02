@@ -1,8 +1,35 @@
 ---
-- name: Install nginx
-  ansible.builtin.apt:
-    name: nginx
-    state: present
+# The package starts nginx right after installing it, with its default site,
+# which listens on [::]:80. On a VM with IPv6 turned off that start fails and
+# dpkg leaves nginx half-installed. So block service starts during the install
+# (policy-rc.d), remove the default site, and start nginx ourselves below.
+- name: Check for an existing policy-rc.d
+  ansible.builtin.stat:
+    path: /usr/sbin/policy-rc.d
+  register: nginx_policy_rc
+
+- name: Install nginx without starting it
+  block:
+    - name: Block service starts during the nginx install
+      ansible.builtin.copy:
+        dest: /usr/sbin/policy-rc.d
+        mode: "0755"
+        content: |
+          #!/bin/sh
+          # Temporary, added by Ansible (roles/nginx) during the nginx install.
+          exit 101
+      when: not nginx_policy_rc.stat.exists
+
+    - name: Install nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+  always:
+    - name: Allow service starts again
+      ansible.builtin.file:
+        path: /usr/sbin/policy-rc.d
+        state: absent
+      when: not nginx_policy_rc.stat.exists
 
 - name: Create SSL directory
   ansible.builtin.file:
